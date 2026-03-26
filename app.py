@@ -7,6 +7,10 @@ import pandas as pd
 from scipy import stats
 
 from utils import tests as T
+from utils.ai_assistant import (
+    auto_insight_stream, chat_stream,
+    get_preset_questions, check_api_key,
+)
 from utils.visualizations import (
     plot_test_distribution, plot_confidence_interval,
     plot_power_curve, plot_error_types,
@@ -335,10 +339,18 @@ if st.session_state.get("result"):
         """, unsafe_allow_html=True)
 
     # ── Tabs
-    tab_labels = ["📊 分布・棄却域", "📏 区間推定", "⚡ 検出力分析"]
+    _has_ai = check_api_key()
+    _ai_label = "🤖 AI分析" if _has_ai else "🤖 AI分析 🔑"
+    tab_labels = ["📊 分布・棄却域", "📏 区間推定", "⚡ 検出力分析", _ai_label]
     if test_key_s == "chi2":
-        tab_labels = ["📊 分布・棄却域", "🔲 分割表"]
+        tab_labels = ["📊 分布・棄却域", "🔲 分割表", _ai_label]
     tabs = st.tabs(tab_labels)
+
+    # Reset chat history when a new test is run
+    if st.session_state.get("_last_test_key") != (test_key_s, result.statistic, result.p_value):
+        st.session_state["chat_history"] = []
+        st.session_state["ai_insight"] = None
+        st.session_state["_last_test_key"] = (test_key_s, result.statistic, result.p_value)
 
     # Tab 1: distribution
     with tabs[0]:
@@ -453,6 +465,121 @@ if st.session_state.get("result"):
                     plot_error_types(mu0_v, result.mean1, result.std1 or 1.0,
                                     result.n or 30, result.alpha),
                     use_container_width=True)
+
+    # ── AI Tab (always last) ──────────────────────────────────────────────────
+    ai_tab_idx = len(tab_labels) - 1
+    with tabs[ai_tab_idx]:
+        if not _has_ai:
+            st.markdown("""
+            <div class="result-card accept" style="margin-top:8px">
+              <div class="result-title accept">🔑 APIキーが必要です</div>
+              <div style="color:#8b949e;font-size:.9rem;margin-top:6px">
+                AI分析機能を使うには <code>ANTHROPIC_API_KEY</code> 環境変数を設定してください。<br>
+                <code>set ANTHROPIC_API_KEY=sk-ant-...</code>（Windows）またはシェルに設定後、アプリを再起動してください。
+              </div>
+            </div>
+            """, unsafe_allow_html=True)
+        else:
+            # ── Auto insight ──────────────────────────────────────────────
+            st.markdown(sh("✨", "AIによる自動分析レポート"), unsafe_allow_html=True)
+
+            col_ins, col_btn = st.columns([4, 1])
+            with col_btn:
+                regen = st.button("🔄 再生成", key="regen_insight")
+
+            if regen:
+                st.session_state["ai_insight"] = None
+
+            if st.session_state.get("ai_insight") is None:
+                with col_ins:
+                    with st.spinner("AIが分析中..."):
+                        insight_placeholder = st.empty()
+                        full_text = ""
+                        for chunk in auto_insight_stream(result, data_dict or {}):
+                            full_text += chunk
+                            insight_placeholder.markdown(full_text + "▌")
+                        insight_placeholder.markdown(full_text)
+                        st.session_state["ai_insight"] = full_text
+            else:
+                with col_ins:
+                    st.markdown(st.session_state["ai_insight"])
+
+            st.divider()
+
+            # ── Preset questions ──────────────────────────────────────────
+            st.markdown(sh("💡", "よくある深堀り質問"), unsafe_allow_html=True)
+            preset_qs = get_preset_questions(result)
+
+            cols_q = st.columns(min(3, len(preset_qs)))
+            for i, q in enumerate(preset_qs[:3]):
+                with cols_q[i]:
+                    if st.button(q, key=f"preset_q_{i}", use_container_width=True):
+                        st.session_state["chat_history"].append({"role": "user", "content": q})
+                        st.session_state["pending_ai_response"] = True
+
+            if len(preset_qs) > 3:
+                cols_q2 = st.columns(len(preset_qs) - 3)
+                for i, q in enumerate(preset_qs[3:]):
+                    with cols_q2[i]:
+                        if st.button(q, key=f"preset_q_{i+3}", use_container_width=True):
+                            st.session_state["chat_history"].append({"role": "user", "content": q})
+                            st.session_state["pending_ai_response"] = True
+
+            st.divider()
+
+            # ── Chat interface ────────────────────────────────────────────
+            st.markdown(sh("💬", "自由に質問する"), unsafe_allow_html=True)
+
+            # Render existing chat messages
+            chat_container = st.container()
+            with chat_container:
+                for msg in st.session_state.get("chat_history", []):
+                    with st.chat_message(msg["role"],
+                                         avatar="🧑‍💼" if msg["role"] == "user" else "🤖"):
+                        st.markdown(msg["content"])
+
+            # Handle pending AI response (from preset button click)
+            if st.session_state.get("pending_ai_response"):
+                st.session_state["pending_ai_response"] = False
+                history = st.session_state["chat_history"]
+                with st.chat_message("assistant", avatar="🤖"):
+                    response_placeholder = st.empty()
+                    full_resp = ""
+                    for chunk in chat_stream(history, result, data_dict or {}):
+                        full_resp += chunk
+                        response_placeholder.markdown(full_resp + "▌")
+                    response_placeholder.markdown(full_resp)
+                st.session_state["chat_history"].append(
+                    {"role": "assistant", "content": full_resp}
+                )
+                st.rerun()
+
+            # Free text input
+            if user_input := st.chat_input("検定結果について何でも質問してください…"):
+                st.session_state["chat_history"].append(
+                    {"role": "user", "content": user_input}
+                )
+                with st.chat_message("user", avatar="🧑‍💼"):
+                    st.markdown(user_input)
+
+                history = st.session_state["chat_history"]
+                with st.chat_message("assistant", avatar="🤖"):
+                    response_placeholder = st.empty()
+                    full_resp = ""
+                    for chunk in chat_stream(history, result, data_dict or {}):
+                        full_resp += chunk
+                        response_placeholder.markdown(full_resp + "▌")
+                    response_placeholder.markdown(full_resp)
+
+                st.session_state["chat_history"].append(
+                    {"role": "assistant", "content": full_resp}
+                )
+
+            # Clear chat button
+            if st.session_state.get("chat_history"):
+                if st.button("🗑️ チャット履歴をクリア", key="clear_chat"):
+                    st.session_state["chat_history"] = []
+                    st.rerun()
 
 else:
     st.markdown('<div class="ib" style="margin-top:16px">👆 パラメータを設定して「検定を実行」ボタンを押してください</div>',
